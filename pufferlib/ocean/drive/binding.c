@@ -4,25 +4,25 @@
 #define MY_PUT
 #include "../env_binding.h"
 
-static int my_put(Env *env, PyObject *args, PyObject *kwargs) {
-    PyObject *obs = PyDict_GetItemString(kwargs, "observations");
+static int my_put(Env* env, PyObject* args, PyObject* kwargs) {
+    PyObject* obs = PyDict_GetItemString(kwargs, "observations");
     if (!PyObject_TypeCheck(obs, &PyArray_Type)) {
         PyErr_SetString(PyExc_TypeError, "Observations must be a NumPy array");
         return 1;
     }
-    PyArrayObject *observations = (PyArrayObject *)obs;
+    PyArrayObject* observations = (PyArrayObject*)obs;
     if (!PyArray_ISCONTIGUOUS(observations)) {
         PyErr_SetString(PyExc_ValueError, "Observations must be contiguous");
         return 1;
     }
     env->observations = PyArray_DATA(observations);
 
-    PyObject *act = PyDict_GetItemString(kwargs, "actions");
+    PyObject* act = PyDict_GetItemString(kwargs, "actions");
     if (!PyObject_TypeCheck(act, &PyArray_Type)) {
         PyErr_SetString(PyExc_TypeError, "Actions must be a NumPy array");
         return 1;
     }
-    PyArrayObject *actions = (PyArrayObject *)act;
+    PyArrayObject* actions = (PyArrayObject*)act;
     if (!PyArray_ISCONTIGUOUS(actions)) {
         PyErr_SetString(PyExc_ValueError, "Actions must be contiguous");
         return 1;
@@ -33,12 +33,12 @@ static int my_put(Env *env, PyObject *args, PyObject *kwargs) {
         return 1;
     }
 
-    PyObject *rew = PyDict_GetItemString(kwargs, "rewards");
+    PyObject* rew = PyDict_GetItemString(kwargs, "rewards");
     if (!PyObject_TypeCheck(rew, &PyArray_Type)) {
         PyErr_SetString(PyExc_TypeError, "Rewards must be a NumPy array");
         return 1;
     }
-    PyArrayObject *rewards = (PyArrayObject *)rew;
+    PyArrayObject* rewards = (PyArrayObject*)rew;
     if (!PyArray_ISCONTIGUOUS(rewards)) {
         PyErr_SetString(PyExc_ValueError, "Rewards must be contiguous");
         return 1;
@@ -49,12 +49,12 @@ static int my_put(Env *env, PyObject *args, PyObject *kwargs) {
     }
     env->rewards = PyArray_DATA(rewards);
 
-    PyObject *term = PyDict_GetItemString(kwargs, "terminals");
+    PyObject* term = PyDict_GetItemString(kwargs, "terminals");
     if (!PyObject_TypeCheck(term, &PyArray_Type)) {
         PyErr_SetString(PyExc_TypeError, "Terminals must be a NumPy array");
         return 1;
     }
-    PyArrayObject *terminals = (PyArrayObject *)term;
+    PyArrayObject* terminals = (PyArrayObject*)term;
     if (!PyArray_ISCONTIGUOUS(terminals)) {
         PyErr_SetString(PyExc_ValueError, "Terminals must be contiguous");
         return 1;
@@ -67,80 +67,109 @@ static int my_put(Env *env, PyObject *args, PyObject *kwargs) {
     return 0;
 }
 
-static PyObject *my_shared(PyObject *self, PyObject *args, PyObject *kwargs) {
-    // Get map_files list from Python (already sorted, full paths)
-    PyObject *map_files_list = PyDict_GetItemString(kwargs, "map_files");
-    if (map_files_list == NULL || !PyList_Check(map_files_list)) {
-        PyErr_SetString(PyExc_TypeError, "map_files must be a list of strings");
-        return NULL;
-    }
-    int map_file_count = PyList_Size(map_files_list);
-    if (map_file_count == 0) {
-        PyErr_SetString(PyExc_ValueError, "map_files list is empty");
-        return NULL;
-    }
-
+static PyObject* my_shared(PyObject* self, PyObject* args, PyObject* kwargs) {
     int num_agents = unpack(kwargs, "num_agents");
     int num_maps = unpack(kwargs, "num_maps");
     int init_mode = unpack(kwargs, "init_mode");
     int control_mode = unpack(kwargs, "control_mode");
     int init_steps = unpack(kwargs, "init_steps");
     int goal_behavior = unpack(kwargs, "goal_behavior");
-    float goal_target_distance = unpack(kwargs, "goal_target_distance");
-    int use_all_maps = unpack(kwargs, "use_all_maps");
-
     clock_gettime(CLOCK_REALTIME, &ts);
     srand(ts.tv_nsec);
     int total_agent_count = 0;
     int env_count = 0;
-    int max_envs = use_all_maps ? num_maps : num_agents;
-    int map_idx = 0;
+    int max_envs = num_agents;
     int maps_checked = 0;
-    PyObject *agent_offsets = PyList_New(max_envs + 1);
-    PyObject *map_ids = PyList_New(max_envs);
+    PyObject* agent_offsets = PyList_New(max_envs+1);
+    PyObject* map_ids = PyList_New(max_envs);
     // getting env count
-    while (use_all_maps ? map_idx < max_envs : total_agent_count < num_agents && env_count < max_envs) {
-        int map_id = use_all_maps ? map_idx++ : rand() % num_maps;
-        Drive *env = calloc(1, sizeof(Drive));
+    while(total_agent_count < num_agents && env_count < max_envs){
+        char map_file[100];
+        int map_id = rand() % num_maps;
+        Drive* env = calloc(1, sizeof(Drive));
         env->init_mode = init_mode;
         env->control_mode = control_mode;
         env->init_steps = init_steps;
         env->goal_behavior = goal_behavior;
-        env->goal_target_distance = goal_target_distance;
-        // Get map file path from Python list
-        PyObject *map_file_obj = PyList_GetItem(map_files_list, map_id);
-        const char *map_file_path = PyUnicode_AsUTF8(map_file_obj);
-        env->entities = load_map_binary(map_file_path, env);
+        sprintf(map_file, "resources/drive/binaries/map_%03d.bin", map_id);
+        load_map_binary(map_file, env);
+
+        // Skip map if it contains traffic lights
+        bool has_traffic_light = false;
+        for(int j=0; j<env->num_traffic_elements; j++) {
+            if(env->traffic_elements[j].type == TRAFFIC_LIGHT) {
+                has_traffic_light = true;
+                break;
+            }
+        }
+        if(has_traffic_light) {
+            maps_checked++;
+
+            // Safeguard: if we've checked all available maps and all have traffic lights, raise an error
+            if(maps_checked >= num_maps) {
+                for(int j=0;j<env->num_total_agents;j++) free_agent(&env->agents[j]);
+                for (int j=0;j<env->num_road_elements;j++) free_road_element(&env->road_elements[j]);
+                for (int j=0;j<env->num_traffic_elements;j++) free_traffic_element(&env->traffic_elements[j]);
+                free(env->agents);
+                free(env->road_elements);
+                free(env->traffic_elements);
+                free(env->active_agent_indices);
+                free(env->static_agent_indices);
+                free(env->expert_static_agent_indices);
+                free(env);
+                Py_DECREF(agent_offsets);
+                Py_DECREF(map_ids);
+                char error_msg[256];
+                sprintf(error_msg, "All %d available maps contain traffic lights which are not supported", num_maps);
+                PyErr_SetString(PyExc_ValueError, error_msg);
+                return NULL;
+            }
+
+            for(int j=0;j<env->num_total_agents;j++) free_agent(&env->agents[j]);
+            for (int j=0;j<env->num_road_elements;j++) free_road_element(&env->road_elements[j]);
+            for (int j=0;j<env->num_traffic_elements;j++) free_traffic_element(&env->traffic_elements[j]);
+            free(env->agents);
+            free(env->road_elements);
+            free(env->traffic_elements);
+            free(env->active_agent_indices);
+            free(env->static_agent_indices);
+            free(env->expert_static_agent_indices);
+            free(env);
+            continue;
+        }
+
         set_active_agents(env);
 
         // Skip map if it doesn't contain any controllable agents
-        if (env->active_agent_count == 0) {
-            if (!use_all_maps) {
-                maps_checked++;
+        if(env->active_agent_count == 0) {
+            maps_checked++;
 
-                // Safeguard: if we've checked all available maps and found no active agents, raise an error
-                if (maps_checked >= num_maps) {
-                    for (int j = 0; j < env->num_entities; j++) {
-                        free_entity(&env->entities[j]);
-                    }
-                    free(env->entities);
-                    free(env->active_agent_indices);
-                    free(env->static_agent_indices);
-                    free(env->expert_static_agent_indices);
-                    free(env);
-                    Py_DECREF(agent_offsets);
-                    Py_DECREF(map_ids);
-                    char error_msg[256];
-                    sprintf(error_msg, "No controllable agents found in any of the %d available maps", num_maps);
-                    PyErr_SetString(PyExc_ValueError, error_msg);
-                    return NULL;
-                }
+            // Safeguard: if we've checked all available maps and found no active agents, raise an error
+            if(maps_checked >= num_maps) {
+                for(int j=0;j<env->num_total_agents;j++) free_agent(&env->agents[j]);
+                for (int j=0;j<env->num_road_elements;j++) free_road_element(&env->road_elements[j]);
+                for (int j=0;j<env->num_traffic_elements;j++) free_traffic_element(&env->traffic_elements[j]);
+                free(env->agents);
+                free(env->road_elements);
+                free(env->traffic_elements);
+                free(env->active_agent_indices);
+                free(env->static_agent_indices);
+                free(env->expert_static_agent_indices);
+                free(env);
+                Py_DECREF(agent_offsets);
+                Py_DECREF(map_ids);
+                char error_msg[256];
+                sprintf(error_msg, "No controllable agents found in any of the %d available maps", num_maps);
+                PyErr_SetString(PyExc_ValueError, error_msg);
+                return NULL;
             }
 
-            for (int j = 0; j < env->num_entities; j++) {
-                free_entity(&env->entities[j]);
-            }
-            free(env->entities);
+            for(int j=0;j<env->num_total_agents;j++) free_agent(&env->agents[j]);
+            for (int j=0;j<env->num_road_elements;j++) free_road_element(&env->road_elements[j]);
+            for (int j=0;j<env->num_traffic_elements;j++) free_traffic_element(&env->traffic_elements[j]);
+            free(env->agents);
+            free(env->road_elements);
+            free(env->traffic_elements);
             free(env->active_agent_indices);
             free(env->static_agent_indices);
             free(env->expert_static_agent_indices);
@@ -149,45 +178,46 @@ static PyObject *my_shared(PyObject *self, PyObject *args, PyObject *kwargs) {
         }
 
         // Store map_id
-        PyObject *map_id_obj = PyLong_FromLong(map_id);
+        PyObject* map_id_obj = PyLong_FromLong(map_id);
         PyList_SetItem(map_ids, env_count, map_id_obj);
         // Store agent offset
-        PyObject *offset = PyLong_FromLong(total_agent_count);
+        PyObject* offset = PyLong_FromLong(total_agent_count);
         PyList_SetItem(agent_offsets, env_count, offset);
         total_agent_count += env->active_agent_count;
         env_count++;
-        for (int j = 0; j < env->num_entities; j++) {
-            free_entity(&env->entities[j]);
-        }
-        free(env->entities);
+        for(int j=0;j<env->num_total_agents;j++) free_agent(&env->agents[j]);
+        for (int j=0;j<env->num_road_elements;j++) free_road_element(&env->road_elements[j]);
+        for (int j=0;j<env->num_traffic_elements;j++) free_traffic_element(&env->traffic_elements[j]);
+        free(env->agents);
+        free(env->road_elements);
+        free(env->traffic_elements);
         free(env->active_agent_indices);
         free(env->static_agent_indices);
         free(env->expert_static_agent_indices);
         free(env);
     }
-    // printf("Generated %d environments to cover %d agents (requested %d agents)\n", env_count, total_agent_count,
-    // num_agents);
-    if (!use_all_maps && total_agent_count >= num_agents) {
+    //printf("Generated %d environments to cover %d agents (requested %d agents)\n", env_count, total_agent_count, num_agents);
+    if(total_agent_count >= num_agents){
         total_agent_count = num_agents;
     }
-    PyObject *final_total_agent_count = PyLong_FromLong(total_agent_count);
+    PyObject* final_total_agent_count = PyLong_FromLong(total_agent_count);
     PyList_SetItem(agent_offsets, env_count, final_total_agent_count);
-    PyObject *final_env_count = PyLong_FromLong(env_count);
+    PyObject* final_env_count = PyLong_FromLong(env_count);
     // resize lists
-    PyObject *resized_agent_offsets = PyList_GetSlice(agent_offsets, 0, env_count + 1);
-    PyObject *resized_map_ids = PyList_GetSlice(map_ids, 0, env_count);
-    PyObject *tuple = PyTuple_New(3);
+    PyObject* resized_agent_offsets = PyList_GetSlice(agent_offsets, 0, env_count + 1);
+    PyObject* resized_map_ids = PyList_GetSlice(map_ids, 0, env_count);
+    PyObject* tuple = PyTuple_New(3);
     PyTuple_SetItem(tuple, 0, resized_agent_offsets);
     PyTuple_SetItem(tuple, 1, resized_map_ids);
     PyTuple_SetItem(tuple, 2, final_env_count);
     return tuple;
 }
 
-static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
+static int my_init(Env* env, PyObject* args, PyObject* kwargs) {
     env->human_agent_idx = unpack(kwargs, "human_agent_idx");
     env->ini_file = unpack_str(kwargs, "ini_file");
     env_init_config conf = {0};
-    if (ini_parse(env->ini_file, handler, &conf) < 0) {
+    if(ini_parse(env->ini_file, handler, &conf) < 0) {
         printf("Error while loading %s", env->ini_file);
     }
     if (kwargs && PyDict_GetItemString(kwargs, "episode_length")) {
@@ -203,6 +233,7 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     env->reward_offroad_collision = conf.reward_offroad_collision;
     env->reward_goal = conf.reward_goal;
     env->reward_goal_post_respawn = conf.reward_goal_post_respawn;
+    env->reward_ade = conf.reward_ade;
     env->episode_length = conf.episode_length;
     env->termination_mode = conf.termination_mode;
     env->collision_behavior = conf.collision_behavior;
@@ -218,7 +249,6 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     char *map_path = unpack_str(kwargs, "map_path");
     int max_agents = unpack(kwargs, "max_agents");
     int init_steps = unpack(kwargs, "init_steps");
-
     env->num_agents = max_agents;
     env->map_name = map_path;
     env->init_steps = init_steps;
@@ -242,6 +272,5 @@ static int my_log(PyObject *dict, Log *log) {
     assign_to_dict(dict, "goals_sampled_this_episode", log->goals_sampled_this_episode);
     assign_to_dict(dict, "goals_reached_this_episode", log->goals_reached_this_episode);
     assign_to_dict(dict, "speed_at_goal", log->speed_at_goal);
-    // assign_to_dict(dict, "avg_displacement_error", log->avg_displacement_error);
     return 0;
 }
