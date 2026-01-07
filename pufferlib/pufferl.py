@@ -1115,6 +1115,10 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
 
 
 def render_adversarial(env_name, args=None, vecenv=None, policy=None):
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Polygon
+    from matplotlib.animation import FuncAnimation
+
     args = args or load_config(env_name)
     args["env"]["map_dir"] = args["eval"]["map_dir"]
 
@@ -1126,7 +1130,7 @@ def render_adversarial(env_name, args=None, vecenv=None, policy=None):
     vecenv = vecenv or load_env(env_name, args)
     policy = policy or load_policy(args, vecenv, env_name)
 
-    # breakpoint()
+    driver = vecenv.driver_env
 
     # Load target policy:
     target_config = args.copy()
@@ -1136,16 +1140,34 @@ def render_adversarial(env_name, args=None, vecenv=None, policy=None):
 
     target_obs_dim = 7
 
-    ob, info = vecenv.reset()
-    driver = vecenv.driver_env
     num_agents = vecenv.observation_space.shape[0]
+    sim_steps = 91
     device = args["train"]["device"]
 
-    # Rebuild visualize binary if saving frames (for C-based rendering)
-    if args["save_frames"] > 0:
-        ensure_drive_binary()
+    trajectories = {
+        "x": np.zeros((num_agents, sim_steps), dtype=np.float32),
+        "y": np.zeros((num_agents, sim_steps), dtype=np.float32),
+        "z": np.zeros((num_agents, sim_steps), dtype=np.float32),
+        "heading": np.zeros((num_agents, sim_steps), dtype=np.float32),
+        "id": np.zeros((num_agents, sim_steps), dtype=np.float32),
+        "is_sdc": np.zeros((num_agents, sim_steps), dtype=np.int32),
+    }
 
+    print("\n Collecting trajectories")
+
+    obs, info = vecenv.reset()
     state = {}
+
+    # Read plotting info from the env
+
+    agent_state = driver.get_global_agent_state()
+    agent_length = agent_state["length"]
+    agent_width = agent_state["width"]
+    road_edge_polylines = driver.get_road_edge_polylines()
+
+    # Tells me who belongs to which map
+    scenario_ids = (driver.get_ground_truth_trajectories())["scenario_id"][:, 0]
+
     if args["train"]["use_rnn"]:
         state = dict(
             lstm_h=torch.zeros(num_agents, policy.hidden_size, device=device),
@@ -1156,51 +1178,108 @@ def render_adversarial(env_name, args=None, vecenv=None, policy=None):
             lstm_c=torch.zeros(num_agents, policy.hidden_size, device=device),
         )
 
-    frames = []
-    while True:
-        render = driver.render()
-        if len(frames) < args["save_frames"]:
-            frames.append(render)
+        for time_idx in range(sim_steps):
+            # Get global state
+            agent_state = driver.get_global_agent_state()
+            trajectories["x"][:, time_idx] = agent_state["x"]
+            trajectories["y"][:, time_idx] = agent_state["y"]
+            trajectories["z"][:, time_idx] = agent_state["z"]
+            trajectories["heading"][:, time_idx] = agent_state["heading"]
+            trajectories["id"][:, time_idx] = agent_state["id"]
 
-        # Screenshot Ocean envs with F12, gifs with control + F12
-        if driver.render_mode == "ansi":
-            print("\033[0;0H" + render + "\n")
-            time.sleep(1 / args["fps"])
-        elif driver.render_mode == "rgb_array":
-            pass
-            # import cv2
-            # render = cv2.cvtColor(render, cv2.COLOR_RGB2BGR)
-            # cv2.imshow('frame', render)
-            # cv2.waitKey(1)
-            # time.sleep(1/args['fps'])
-
-        with torch.no_grad():
-            ob = torch.as_tensor(ob).to(device)
-            logits, value = policy.forward_eval(ob, state)
-            action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
-
-            target_logits, target_value = target_policy.forward_eval(ob[:, :-target_obs_dim], target_state)
-            target_action, target_logprob, _ = pufferlib.pytorch.sample_logits(target_logits)
-
-            target_mask = torch.zeros_like(target_action, device=device, dtype=bool)
             sdc_indices = info[0]["sdc_track_index"]
             valid_indices = sdc_indices[sdc_indices != -1]
-            target_mask[valid_indices] = 1
 
-            action = torch.where(target_mask, target_action, action)
+            trajectories["is_sdc"][valid_indices, time_idx] = 1
 
-            action = action.cpu().numpy().reshape(vecenv.action_space.shape)
+            # Step policy
+            with torch.no_grad():
+                ob_tensor = torch.as_tensor(obs).to(device)
 
-        if isinstance(logits, torch.distributions.Normal):
-            action = np.clip(action, vecenv.action_space.low, vecenv.action_space.high)
+                logits, value = policy.forward_eval(ob_tensor, state)
+                action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
 
-        ob, r, d, t, info = vecenv.step(action)
+                target_logits, target_value = target_policy.forward_eval(ob_tensor[:, :-target_obs_dim], target_state)
+                target_action, target_logprob, _ = pufferlib.pytorch.sample_logits(target_logits)
 
-        if len(frames) > 0 and len(frames) == args["save_frames"]:
-            import imageio
+                target_mask = torch.zeros_like(target_action, device=device, dtype=bool)
+                sdc_indices = info[0]["sdc_track_index"]
+                valid_indices = sdc_indices[sdc_indices != -1]
+                target_mask[valid_indices] = 1
 
-            imageio.mimsave(args["gif_path"], frames, fps=args["fps"], loop=0)
-            frames.append("Done")
+                action = torch.where(target_mask, target_action, action)
+
+                action_np = action.cpu().numpy().reshape(vecenv.action_space.shape)
+
+            if isinstance(logits, torch.distributions.Normal):
+                action_np = np.clip(action_np, vecenv.action_space.low, vecenv.action_space.high)
+
+            obs, _, _, _, info = vecenv.step(action_np)
+
+        print("\nTrajectories collected")
+
+        def plot_road_edges(ax, road_edge_polylines, scenario_id):
+            """Plot road edge polylines for a specific scenario."""
+            lengths = road_edge_polylines["lengths"]
+            scenario_ids = road_edge_polylines["scenario_id"]
+            x = road_edge_polylines["x"]
+            y = road_edge_polylines["y"]
+
+            pt_idx = 0
+            for i in range(len(lengths)):
+                length = lengths[i]
+                if scenario_ids[i] == scenario_id:
+                    poly_x = x[pt_idx : pt_idx + length]
+                    poly_y = y[pt_idx : pt_idx + length]
+                    ax.plot(poly_x, poly_y, "k-", linewidth=1, alpha=0.7)
+                pt_idx += length
+
+        def get_box_corners(x, y, heading, length, width):
+            c, s = np.cos(heading), np.sin(heading)
+
+            R = np.array(((c, -s), (s, c)))
+
+            l2, w2 = length / 2, width / 2
+            corners = np.array([[l2, w2], [l2, -w2], [-l2, -w2], [-l2, w2]]).T
+            rotated_corners = R @ corners
+            rotated_corners[0, :] += x
+            rotated_corners[1, :] += y
+
+            return rotated_corners.T
+
+        def update_frame(t, ax, scenario_id):
+            ax.clear()
+
+            plot_road_edges(ax, road_edge_polylines, scenario_id)
+            agent_mask = np.where(scenario_ids == scenario_id)[0]
+
+            for i in agent_mask:
+                x = trajectories["x"][i, t]
+                y = trajectories["y"][i, t]
+                h = trajectories["heading"][i, t]
+                l = agent_length[i]
+                w = agent_width[i]
+                is_sdc = trajectories["is_sdc"][i, t]
+
+                corners = get_box_corners(x, y, h, l, w)
+                color = "#f5756c" if is_sdc else "#7aabe7"
+
+                rect = Polygon(corners, closed=True, facecolor=color, alpha=0.8)
+                ax.add_patch(rect)
+
+            ax.set_aspect("equal")
+
+        print("\n Plotting Trajectories")
+
+        unique_scenarios = np.unique(scenario_ids)
+        for scenario_id in unique_scenarios:
+            fig, ax = plt.subplots(figsize=(10, 10))
+
+            # Create animation
+            ani = FuncAnimation(fig, update_frame, fargs=(ax, scenario_id), frames=sim_steps, interval=50)
+
+            ani.save(f"scenario_{scenario_id}.mp4", writer="ffmpeg")
+            plt.close(fig)
 
 
 def eval(env_name, args=None, vecenv=None, policy=None):
