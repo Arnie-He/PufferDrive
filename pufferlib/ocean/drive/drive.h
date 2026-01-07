@@ -2383,7 +2383,17 @@ void c_step(Drive *env) {
 
                     // Rather totally erase its reward so its only adv
                     env->logs[i].episode_return += -env->rewards[i];
-                    env->rewards[i] = env->reward_adversarial * (-sdc_reward);
+                    // env->rewards[i] = env->reward_adversarial * (-sdc_reward);
+
+                    // Alternative for debugging, get into the sdc, please :)
+                    Entity *ego_entity = &env->entities[env->active_agent_indices[i]];
+                    Entity *target_entity = &env->entities[env->sdc_track_index];
+
+                    float dx = target_entity->x - ego_entity->x;
+                    float dy = target_entity->y - ego_entity->y;
+
+                    env->rewards[i] = -dx * dx - dy * dy;
+
                     env->logs[i].episode_return += env->rewards[i];
                 }
             }
