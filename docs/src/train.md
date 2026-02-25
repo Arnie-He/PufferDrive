@@ -66,3 +66,32 @@ This will launch separate training runs for each value in the list, which cab be
 - Architecture search
 - Running multiple random seeds
 - Ablation studies
+
+## Inverse-RL baseline (single controlled agent)
+
+For a baseline inverse-RL pipeline in the one-agent setting (`control_sdc_only`),
+use `examples/drive_inverse_rl_baseline.py`. It trains an SB3 PPO expert, collects
+demonstrations, then trains AIRL with the `imitation` library.
+
+Install extra dependencies:
+
+```bash
+pip install stable-baselines3 imitation
+```
+
+Run the full baseline:
+
+```bash
+# 1) Train expert in control_sdc_only mode
+python examples/drive_inverse_rl_baseline.py train_expert --total-timesteps 1000000
+
+# 2) Collect expert demonstrations
+python examples/drive_inverse_rl_baseline.py collect_demos \
+  --expert-path experiments/drive_inverse_rl/expert_ppo.zip \
+  --num-episodes 128
+
+# 3) Train AIRL from demos
+python examples/drive_inverse_rl_baseline.py train_airl \
+  --demos-path experiments/drive_inverse_rl/expert_trajectories.pkl \
+  --total-timesteps 1000000
+```
