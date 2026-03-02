@@ -95,3 +95,26 @@ python examples/drive_inverse_rl_baseline.py train_airl \
   --demos-path experiments/drive_inverse_rl/expert_trajectories.pkl \
   --total-timesteps 1000000
 ```
+
+Enable W&B on any stage by appending:
+
+```bash
+--wandb --wandb-project pufferdrive-irl --wandb-group baselines
+```
+
+Visualize a trained SB3 policy:
+```bash
+xvfb-run -s "-screen 0 1280x720x24" \
+python examples/drive_inverse_rl_baseline.py render_policy \
+  --policy-path experiments/drive_inverse_rl/airl_generator_policy.zip \
+  --num-episodes 3 --max-steps-per-episode 200 --render-mode human
+```
+
+Save visualization to video:
+```bash
+xvfb-run -s "-screen 0 1280x720x24" \
+python examples/drive_inverse_rl_baseline.py render_policy \
+  --policy-path experiments/drive_inverse_rl/airl_generator_policy.zip \
+  --num-episodes 3 --max-steps-per-episode 200 --render-mode human \
+  --save-video-path experiments/drive_inverse_rl/renders/airl_rollout.mp4
+```

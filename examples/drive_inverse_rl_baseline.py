@@ -14,7 +14,10 @@ other scene actors follow replay/static behavior from logs.
 from __future__ import annotations
 
 import argparse
+import os
 import pickle
+import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -47,6 +50,95 @@ def _require_optional_deps() -> tuple[Any, Any, Any, Any]:
         ) from exc
 
     return PPO, Monitor, DummyVecEnv, (AIRL, Trajectory, BasicShapedRewardNet)
+
+
+def _maybe_init_wandb(args, job_type: str):
+    if not args.wandb:
+        return None, None
+
+    try:
+        import wandb
+    except ImportError as exc:
+        raise ImportError(
+            "Missing wandb dependency. Install with:\n"
+            "  pip install wandb"
+        ) from exc
+
+    run = wandb.init(
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        group=args.wandb_group,
+        name=args.wandb_run_name,
+        job_type=job_type,
+        tags=args.wandb_tags,
+        config=vars(args),
+        sync_tensorboard=True,
+    )
+    tensorboard_log = str(Path(args.output_dir) / "tensorboard" / job_type)
+    return run, tensorboard_log
+
+
+def _finish_wandb(run, **summary):
+    if run is None:
+        return
+
+    for key, value in summary.items():
+        run.summary[key] = value
+
+    import wandb
+
+    wandb.finish()
+
+
+def _normalize_display(display_env: str) -> str:
+    # x11grab expects display in host.display form (e.g., :99.0)
+    return display_env if "." in display_env else f"{display_env}.0"
+
+
+def _start_ffmpeg_capture(args):
+    if args.save_video_path is None:
+        return None
+
+    display = os.environ.get("DISPLAY")
+    if not display:
+        raise RuntimeError(
+            "DISPLAY is not set. For headless capture, run with xvfb-run, e.g.\n"
+            'xvfb-run -s "-screen 0 1280x720x24" python ... render_policy --save-video-path <out.mp4>'
+        )
+
+    out_path = Path(args.save_video_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    input_display = _normalize_display(display)
+    ffmpeg_cmd = [
+        "ffmpeg",
+        "-y",
+        "-f",
+        "x11grab",
+        "-video_size",
+        args.video_size,
+        "-framerate",
+        str(args.video_fps),
+        "-i",
+        input_display,
+        "-vcodec",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        str(out_path),
+    ]
+    proc = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return proc
+
+
+def _stop_ffmpeg_capture(proc):
+    if proc is None:
+        return
+
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
 
 
 @dataclass
@@ -136,6 +228,9 @@ class SingleAgentDriveEnv(gym.Env):
     def close(self):
         self._env.close()
 
+    def render(self):
+        return self._env.render()
+
 
 def _make_env_fn(cfg: DriveEnvConfig):
     def thunk():
@@ -146,6 +241,7 @@ def _make_env_fn(cfg: DriveEnvConfig):
 
 def train_expert(args):
     PPO, Monitor, DummyVecEnv, _ = _require_optional_deps()
+    run, tb_log_dir = _maybe_init_wandb(args, "train_expert")
     cfg = DriveEnvConfig(
         map_dir=args.map_dir,
         num_maps=args.num_maps,
@@ -157,28 +253,34 @@ def train_expert(args):
     )
 
     env = DummyVecEnv([lambda: Monitor(_make_env_fn(cfg)())])
-    model = PPO(
-        "MlpPolicy",
-        env,
-        learning_rate=args.learning_rate,
-        n_steps=args.n_steps,
-        batch_size=args.batch_size,
-        n_epochs=args.n_epochs,
-        gamma=args.gamma,
-        gae_lambda=args.gae_lambda,
-        verbose=1,
-        seed=args.seed,
-        device=args.device,
-    )
-    model.learn(total_timesteps=args.total_timesteps)
-    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    model_path = Path(args.output_dir) / "expert_ppo.zip"
-    model.save(str(model_path))
-    print(f"Saved expert policy: {model_path}")
+    try:
+        model = PPO(
+            "MlpPolicy",
+            env,
+            learning_rate=args.learning_rate,
+            n_steps=args.n_steps,
+            batch_size=args.batch_size,
+            n_epochs=args.n_epochs,
+            gamma=args.gamma,
+            gae_lambda=args.gae_lambda,
+            verbose=1,
+            seed=args.seed,
+            device=args.device,
+            tensorboard_log=tb_log_dir,
+        )
+
+        model.learn(total_timesteps=args.total_timesteps)
+        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+        model_path = Path(args.output_dir) / "expert_ppo.zip"
+        model.save(str(model_path))
+        print(f"Saved expert policy: {model_path}")
+    finally:
+        _finish_wandb(run, expert_model_path=str(Path(args.output_dir) / "expert_ppo.zip"))
 
 
 def collect_demos(args):
     PPO, _, _, (_, Trajectory, _) = _require_optional_deps()
+    run, _ = _maybe_init_wandb(args, "collect_demos")
     cfg = DriveEnvConfig(
         map_dir=args.map_dir,
         num_maps=args.num_maps,
@@ -192,43 +294,54 @@ def collect_demos(args):
     env = SingleAgentDriveEnv(cfg)
     model = PPO.load(args.expert_path, device=args.device)
 
-    trajectories = []
-    for ep in range(args.num_episodes):
-        obs, _ = env.reset(seed=args.seed + ep)
-        obs_seq = [obs]
-        act_seq = []
-        info_seq = []
-        done = False
+    try:
+        trajectories = []
+        traj_lens = []
+        for ep in range(args.num_episodes):
+            obs, _ = env.reset(seed=args.seed + ep)
+            obs_seq = [obs]
+            act_seq = []
+            info_seq = []
+            done = False
 
-        while not done:
-            action, _ = model.predict(obs, deterministic=True)
-            next_obs, _, terminated, truncated, info = env.step(action)
-            act_seq.append(np.array(action))
-            info_seq.append(info)
-            obs_seq.append(next_obs)
-            obs = next_obs
-            done = terminated or truncated
+            while not done:
+                action, _ = model.predict(obs, deterministic=True)
+                next_obs, _, terminated, truncated, info = env.step(action)
+                act_seq.append(np.array(action))
+                info_seq.append(info)
+                obs_seq.append(next_obs)
+                obs = next_obs
+                done = terminated or truncated
 
-        traj = Trajectory(
-            obs=np.asarray(obs_seq, dtype=np.float32),
-            acts=np.asarray(act_seq),
-            infos=np.asarray(info_seq, dtype=object),
-            terminal=True,
+            traj = Trajectory(
+                obs=np.asarray(obs_seq, dtype=np.float32),
+                acts=np.asarray(act_seq),
+                infos=np.asarray(info_seq, dtype=object),
+                terminal=True,
+            )
+            trajectories.append(traj)
+            traj_lens.append(len(act_seq))
+            print(f"Collected trajectory {ep + 1}/{args.num_episodes} (len={len(act_seq)})")
+
+        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+        demos_path = Path(args.output_dir) / "expert_trajectories.pkl"
+        with open(demos_path, "wb") as f:
+            pickle.dump(trajectories, f)
+        print(f"Saved demonstrations: {demos_path}")
+    finally:
+        env.close()
+        mean_len = float(np.mean(traj_lens)) if "traj_lens" in locals() and traj_lens else 0.0
+        _finish_wandb(
+            run,
+            demos_path=str(Path(args.output_dir) / "expert_trajectories.pkl"),
+            num_trajectories=len(traj_lens) if "traj_lens" in locals() else 0,
+            mean_traj_len=mean_len,
         )
-        trajectories.append(traj)
-        print(f"Collected trajectory {ep + 1}/{args.num_episodes} (len={len(act_seq)})")
-
-    env.close()
-
-    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    demos_path = Path(args.output_dir) / "expert_trajectories.pkl"
-    with open(demos_path, "wb") as f:
-        pickle.dump(trajectories, f)
-    print(f"Saved demonstrations: {demos_path}")
 
 
 def train_airl(args):
     PPO, Monitor, DummyVecEnv, (AIRL, _, BasicShapedRewardNet) = _require_optional_deps()
+    run, tb_log_dir = _maybe_init_wandb(args, "train_airl")
     cfg = DriveEnvConfig(
         map_dir=args.map_dir,
         num_maps=args.num_maps,
@@ -243,35 +356,94 @@ def train_airl(args):
         demonstrations = pickle.load(f)
 
     venv = DummyVecEnv([lambda: Monitor(_make_env_fn(cfg)())])
-    gen_algo = PPO(
-        "MlpPolicy",
-        venv,
-        learning_rate=args.learning_rate,
-        n_steps=args.n_steps,
-        batch_size=args.batch_size,
-        n_epochs=args.n_epochs,
-        gamma=args.gamma,
-        gae_lambda=args.gae_lambda,
-        verbose=1,
-        seed=args.seed,
-        device=args.device,
+    try:
+        gen_algo = PPO(
+            "MlpPolicy",
+            venv,
+            learning_rate=args.learning_rate,
+            n_steps=args.n_steps,
+            batch_size=args.batch_size,
+            n_epochs=args.n_epochs,
+            gamma=args.gamma,
+            gae_lambda=args.gae_lambda,
+            verbose=1,
+            seed=args.seed,
+            device=args.device,
+            tensorboard_log=tb_log_dir,
+        )
+
+        reward_net = BasicShapedRewardNet(venv.observation_space, venv.action_space)
+        airl_trainer = AIRL(
+            demonstrations=demonstrations,
+            demo_batch_size=args.demo_batch_size,
+            gen_replay_buffer_capacity=args.gen_replay_buffer_capacity,
+            n_disc_updates_per_round=args.n_disc_updates_per_round,
+            venv=venv,
+            gen_algo=gen_algo,
+            reward_net=reward_net,
+            allow_variable_horizon=args.allow_variable_horizon,
+        )
+        airl_trainer.train(total_timesteps=args.total_timesteps)
+
+        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+        policy_path = Path(args.output_dir) / "airl_generator_policy.zip"
+        gen_algo.save(str(policy_path))
+        print(f"Saved AIRL generator policy: {policy_path}")
+    finally:
+        _finish_wandb(run, airl_policy_path=str(Path(args.output_dir) / "airl_generator_policy.zip"))
+
+
+def render_policy(args):
+    PPO, _, _, _ = _require_optional_deps()
+    run, _ = _maybe_init_wandb(args, "render_policy")
+    cfg = DriveEnvConfig(
+        map_dir=args.map_dir,
+        num_maps=args.num_maps,
+        episode_length=args.episode_length,
+        goal_behavior=args.goal_behavior,
+        action_type=args.action_type,
+        dynamics_model=args.dynamics_model,
+        termination_mode=args.termination_mode,
+        render_mode=args.render_mode,
     )
 
-    reward_net = BasicShapedRewardNet(venv.observation_space, venv.action_space)
-    airl_trainer = AIRL(
-        demonstrations=demonstrations,
-        demo_batch_size=args.demo_batch_size,
-        venv=venv,
-        gen_algo=gen_algo,
-        reward_net=reward_net,
-        allow_variable_horizon=args.allow_variable_horizon,
-    )
-    airl_trainer.train(total_timesteps=args.total_timesteps)
+    env = SingleAgentDriveEnv(cfg)
+    model = PPO.load(args.policy_path, device=args.device)
 
-    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    policy_path = Path(args.output_dir) / "airl_generator_policy.zip"
-    gen_algo.save(str(policy_path))
-    print(f"Saved AIRL generator policy: {policy_path}")
+    steps_rendered = 0
+    episodes_rendered = 0
+    capture_proc = None
+    try:
+        # Create the render window before starting ffmpeg capture.
+        obs, _ = env.reset(seed=args.seed)
+        env.render()
+        if args.save_video_path is not None:
+            capture_proc = _start_ffmpeg_capture(args)
+            # Give ffmpeg a moment to attach to the X display.
+            time.sleep(0.5)
+
+        for ep in range(args.num_episodes):
+            if ep > 0:
+                obs, _ = env.reset(seed=args.seed + ep)
+            done = False
+            ep_steps = 0
+            while not done and ep_steps < args.max_steps_per_episode:
+                action, _ = model.predict(obs, deterministic=args.deterministic)
+                obs, _, terminated, truncated, _ = env.step(action)
+                env.render()
+                done = terminated or truncated
+                ep_steps += 1
+                steps_rendered += 1
+
+            episodes_rendered += 1
+            print(f"Rendered episode {ep + 1}/{args.num_episodes} with {ep_steps} steps")
+    finally:
+        _stop_ffmpeg_capture(capture_proc)
+        env.close()
+        summary = dict(episodes_rendered=episodes_rendered, steps_rendered=steps_rendered)
+        if args.save_video_path is not None:
+            summary["render_video_path"] = str(Path(args.save_video_path))
+        _finish_wandb(run, **summary)
 
 
 def build_parser():
@@ -295,6 +467,12 @@ def build_parser():
         p.add_argument("--seed", type=int, default=42)
         p.add_argument("--device", type=str, default="auto")
         p.add_argument("--output-dir", type=str, default="experiments/drive_inverse_rl")
+        p.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging.")
+        p.add_argument("--wandb-project", type=str, default="pufferdrive-irl")
+        p.add_argument("--wandb-entity", type=str, default=None)
+        p.add_argument("--wandb-group", type=str, default=None)
+        p.add_argument("--wandb-run-name", type=str, default=None)
+        p.add_argument("--wandb-tags", nargs="*", default=[])
 
     def add_ppo_flags(p):
         p.add_argument("--learning-rate", type=float, default=3e-4)
@@ -304,19 +482,24 @@ def build_parser():
         p.add_argument("--gamma", type=float, default=0.99)
         p.add_argument("--gae-lambda", type=float, default=0.95)
 
+    # PPO flags
     p_train_expert = subparsers.add_parser("train_expert", help="Train SB3 PPO expert policy.")
     add_common_flags(p_train_expert)
     add_ppo_flags(p_train_expert)
     p_train_expert.add_argument("--total-timesteps", type=int, default=1_000_000)
 
+    # Collect demos flags
     p_collect = subparsers.add_parser("collect_demos", help="Collect demonstrations from trained expert.")
     add_common_flags(p_collect)
     p_collect.add_argument("--expert-path", type=str, required=True)
     p_collect.add_argument("--num-episodes", type=int, default=128)
 
+    # AIRL flags
     p_airl = subparsers.add_parser("train_airl", help="Train AIRL baseline from demonstrations.")
     add_common_flags(p_airl)
     add_ppo_flags(p_airl)
+    p_airl.add_argument("--gen-replay-buffer-capacity", type=int, default=512)
+    p_airl.add_argument("--n-disc-updates-per-round", type=int, default=1)
     p_airl.add_argument("--demos-path", type=str, required=True)
     p_airl.add_argument("--demo-batch-size", type=int, default=1024)
     p_airl.add_argument("--total-timesteps", type=int, default=1_000_000)
@@ -325,6 +508,31 @@ def build_parser():
         default=True,
         action="store_true",
         help="Pass through to imitation AIRL for variable-length episodes.",
+    )
+
+    # Render policy flags
+    p_render = subparsers.add_parser(
+        "render_policy", help="Render a trained SB3 policy in PufferDrive (live Raylib window)."
+    )
+    add_common_flags(p_render)
+    p_render.add_argument("--policy-path", type=str, required=True)
+    p_render.add_argument("--num-episodes", type=int, default=3)
+    p_render.add_argument("--max-steps-per-episode", type=int, default=200)
+    p_render.add_argument(
+        "--render-mode",
+        type=str,
+        default="human",
+        choices=["human", "raylib"],
+        help="Drive's render backend mode.",
+    )
+    p_render.add_argument("--deterministic", action="store_true")
+    p_render.add_argument("--save-video-path", type=str, default=None)
+    p_render.add_argument("--video-fps", type=int, default=30)
+    p_render.add_argument(
+        "--video-size",
+        type=str,
+        default="1280x720",
+        help='X11 capture size for ffmpeg (e.g. "1280x720").',
     )
 
     return parser
@@ -340,6 +548,8 @@ def main():
         collect_demos(args)
     elif args.command == "train_airl":
         train_airl(args)
+    elif args.command == "render_policy":
+        render_policy(args)
     else:
         raise ValueError(f"Unknown command: {args.command}")
 
